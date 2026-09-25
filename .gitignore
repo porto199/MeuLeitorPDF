@@ -1,0 +1,15 @@
+# Ambientes virtuais
+venv/
+env/
+__pycache__/
+
+# Compilações do PyInstaller
+build/
+dist/
+*.spec
+
+# Ficheiros temporários de áudio
+temp_audio_*.mp3
+
+# Configurações locais de checkpoint
+config_leitor.json
