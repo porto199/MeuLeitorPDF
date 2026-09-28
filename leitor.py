@@ -7,6 +7,7 @@ import re
 import asyncio
 import edge_tts
 import uuid
+import tempfile
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 import pygame
 
@@ -16,7 +17,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout
 from PyQt6.QtGui import QImage, QPixmap, QIcon
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QPoint
 
-CONFIG_FILE = "config_leitor.json"
+CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".config_leitor.json")
 ATALHOS_TEXTO = " (Atalhos: Espaço: Pausar/Retomar | Ctrl+Espaço: Parar)"
 
 class Sinais(QObject):
@@ -201,7 +202,6 @@ class LeitorPDF(QMainWindow):
         container_principal.setLayout(main_layout)
         self.setCentralWidget(container_principal)
         
-        # --- BARRA DE STATUS ---
         self.lbl_status = QLabel(f"Status: Pronto{ATALHOS_TEXTO}")
         self.statusBar().addWidget(self.lbl_status)
         
@@ -264,9 +264,9 @@ class LeitorPDF(QMainWindow):
         <body style="font-family: Arial, sans-serif; font-size: 10pt; color: #333;">
             <b>✨ Funcionalidades Principais:</b>
             <ul>
-                <li>Detecção automática de idioma ao abrir o ficheiro.</li>
+                <li>Deteção automática de idioma ao abrir o ficheiro.</li>
                 <li>Mapeamento inteligente de páginas lógicas.</li>
-                <li>Avanço e retrocesso de frases.</li>
+                <li>Avanço e retrocesso de frases com <b>Leitura de Sentença Completa</b>.</li>
                 <li>Função Ir para [Página].</li>
                 <li>Inversão de cores (Fundo preto e letras brancas).</li>
                 <li>Barra de status com progresso de conversão em tempo real.</li>
@@ -550,7 +550,7 @@ class LeitorPDF(QMainWindow):
             
             asyncio.run(_run())
         except Exception as e:
-            self.sinais.status_exportacao.emit(f"Status: Erro ao exportar - {e}{ATALHOS_TEXTO}")
+            self.sinais.status_exportacao.emit(f"Status: Erro ao exportar - {str(e)}{ATALHOS_TEXTO}")
         finally:
             self.sinais.resetar_botoes_exportacao.emit()
 
@@ -618,7 +618,7 @@ class LeitorPDF(QMainWindow):
             self.ignorar_scroll_inicial = True
             QTimer.singleShot(300, lambda: self.rolar_para_pagina(pagina_inicial))
         except Exception as e:
-            print(f"Erro ao abrir PDF: {e}")
+            self.lbl_status.setText(f"Status: Erro ao abrir PDF - {str(e)}")
 
     def montar_esqueleto_paginas(self):
         for lbl in self.page_labels:
@@ -760,6 +760,7 @@ class LeitorPDF(QMainWindow):
                     nova_posicao = int(posicao_absoluta_y - (viewport_altura / 3))
                     scrollbar.setValue(nova_posicao)
 
+                # Destaca todos os pedaços (linhas) que compõem a sentença
                 for rect in rects:
                     annot = page.add_highlight_annot(rect)
                     cor = (0.2, 0.6, 1.0) if self.dark_mode else (1.0, 0.9, 0.3)
@@ -825,22 +826,35 @@ class LeitorPDF(QMainWindow):
             if self.is_bloco_monoespacado(block):
                 continue
             
+            # --- NOVO: Agrupa todas as linhas do bloco num único parágrafo ---
+            linhas_bloco = []
+            primeiro_y0_bloco = None
+            
             for line in block.get("lines", []):
-                line_bbox = line.get("bbox", (0, 0, 0, 0))
-                line_y0 = line_bbox[1]
+                if primeiro_y0_bloco is None:
+                    primeiro_y0_bloco = line.get("bbox", (0, 0, 0, 0))[1]
                 
                 linha_texto_partes = []
                 for span in line.get("spans", []):
                     linha_texto_partes.append(span.get("text", ""))
-                linha_str = "".join(linha_texto_partes).strip()
-                if not linha_str:
-                    continue
                 
-                frases_linha = re.split(r'(?<=[.!?]) +', linha_str)
-                for f in frases_linha:
-                    f_limpa = f.strip()
-                    if len(f_limpa) >= 2 and not re.match(r'^\d+$', f_limpa):
-                        lista_detalhada.append({"texto": f_limpa, "y0": line_y0})
+                linha_str = "".join(linha_texto_partes).strip()
+                if linha_str:
+                    linhas_bloco.append(linha_str)
+            
+            if not linhas_bloco:
+                continue
+                
+            # Junta as linhas com um espaço (formando o parágrafo real contínuo)
+            bloco_completo = " ".join(linhas_bloco)
+            
+            # Só depois divide o parágrafo completo em sentenças reais (usando os pontos)
+            frases_bloco = re.split(r'(?<=[.!?]) +', bloco_completo)
+            for f in frases_bloco:
+                f_limpa = f.strip()
+                if len(f_limpa) >= 2 and not re.match(r'^\d+$', f_limpa):
+                    lista_detalhada.append({"texto": f_limpa, "y0": primeiro_y0_bloco})
+                    
         return lista_detalhada
 
     def obter_frases(self, pagina_num):
@@ -898,6 +912,7 @@ class LeitorPDF(QMainWindow):
         
         arquivo_pre_gerado = None
         id_pre_gerado = None 
+        temp_dir = tempfile.gettempdir()
 
         try:
             while pagina < len(self.pdf_document):
@@ -939,7 +954,7 @@ class LeitorPDF(QMainWindow):
                 if arquivo_pre_gerado and id_pre_gerado == (pagina, frase_idx, v_voz, v_vel):
                     temp_file = arquivo_pre_gerado
                 else:
-                    temp_file = f"temp_audio_{uuid.uuid4().hex}.mp3"
+                    temp_file = os.path.join(temp_dir, f"temp_audio_{uuid.uuid4().hex}.mp3")
                     self.gerar_audio_neural(texto_tts, v_voz, v_vel, temp_file)
 
                 arquivo_pre_gerado = None
@@ -954,7 +969,7 @@ class LeitorPDF(QMainWindow):
                     if not re.search(r'[.!?:]$', texto_prox_tts):
                         texto_prox_tts += "."
                         
-                    prox_temp = f"temp_audio_{uuid.uuid4().hex}.mp3"
+                    prox_temp = os.path.join(temp_dir, f"temp_audio_{uuid.uuid4().hex}.mp3")
                     self.gerar_audio_neural(texto_prox_tts, v_voz, v_vel, prox_temp)
                     arquivo_pre_gerado = prox_temp
                     id_pre_gerado = (prox_p, prox_idx, v_voz, v_vel)
@@ -986,7 +1001,7 @@ class LeitorPDF(QMainWindow):
                 frase_idx += 1
 
         except Exception as e:
-            print(f"Erro no motor de leitura: {e}")
+            self.sinais.status_exportacao.emit(f"Status: Erro na leitura - {str(e)}{ATALHOS_TEXTO}")
         finally:
             if arquivo_pre_gerado:
                 try: os.remove(arquivo_pre_gerado)
@@ -1002,8 +1017,11 @@ class LeitorPDF(QMainWindow):
 
     def salvar_checkpoint(self):
         if self.pdf_path:
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump({"ultimo_pdf": self.pdf_path, "pagina": self.current_page}, f)
+            try:
+                with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                    json.dump({"ultimo_pdf": self.pdf_path, "pagina": self.current_page}, f)
+            except:
+                pass
 
     def carregar_checkpoint(self):
         if os.path.exists(CONFIG_FILE):
@@ -1029,9 +1047,10 @@ if __name__ == "__main__":
     window.show()
     exit_code = app.exec()
     
-    for file in os.listdir():
+    t_dir = tempfile.gettempdir()
+    for file in os.listdir(t_dir):
         if file.startswith("temp_audio_") and file.endswith(".mp3"):
-            try: os.remove(file)
+            try: os.remove(os.path.join(t_dir, file))
             except: pass
             
     sys.exit(exit_code)

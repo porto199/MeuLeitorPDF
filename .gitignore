@@ -13,3 +13,8 @@ temp_audio_*.mp3
 
 # Configurações locais de checkpoint
 config_leitor.json
+
+# AppImage e Ferramentas de Empacotamento
+*.AppImage
+*.AppDir/
+appimagetool-*.AppImage
