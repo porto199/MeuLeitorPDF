@@ -12,7 +12,7 @@ import pygame
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout,
                              QWidget, QFileDialog, QLabel, QScrollArea, QHBoxLayout,
-                             QComboBox, QListWidget, QDialog, QTextBrowser)
+                             QComboBox, QListWidget, QDialog, QTextBrowser, QInputDialog)
 from PyQt6.QtGui import QImage, QPixmap, QIcon
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QPoint
 
@@ -47,14 +47,17 @@ class LeitorPDF(QMainWindow):
         self.pdf_path = None
         self.zoom_factor = 1.2
         self.current_page = 0
+        self.current_phrase_idx = 0
         self.page_labels = [] 
         self.capitulos_dados = []
+        
+        self.logical_to_physical = {}
+        self.physical_to_logical = {}
         
         self.voz_atual = "pt-BR-AntonioNeural"
         self.velocidade_atual = "+0%"
         self.ignorar_scroll_inicial = True 
 
-        # Temporizador para "Debounce" do Zoom (Aguardar antes de atualizar a tela)
         self.timer_zoom = QTimer()
         self.timer_zoom.setSingleShot(True)
         self.timer_zoom.timeout.connect(self.recalcular_tamanho_paginas)
@@ -94,6 +97,11 @@ class LeitorPDF(QMainWindow):
         self.btn_dark.clicked.connect(self.toggle_dark_mode)
         linha1.addWidget(self.btn_dark)
 
+        self.btn_ir_pagina = QPushButton("📑 Ir para...")
+        self.btn_ir_pagina.clicked.connect(self.ir_para_pagina_dialog)
+        self.btn_ir_pagina.setEnabled(False)
+        linha1.addWidget(self.btn_ir_pagina)
+
         linha1.addWidget(QLabel("  Capítulo:"))
         self.btn_capitulos = QPushButton("--- Sumário Não Encontrado ---")
         self.btn_capitulos.setFixedWidth(280)
@@ -106,11 +114,6 @@ class LeitorPDF(QMainWindow):
         self.btn_export.setEnabled(False)
         linha1.addWidget(self.btn_export)
 
-        self.btn_cancel_export = QPushButton("❌ Cancelar Exportação")
-        self.btn_cancel_export.clicked.connect(self.cancelar_exportacao)
-        self.btn_cancel_export.hide()
-        linha1.addWidget(self.btn_cancel_export)
-        
         linha1.addStretch()
 
         self.btn_sobre = QPushButton("💡 MeuLeitorPDF")
@@ -139,7 +142,7 @@ class LeitorPDF(QMainWindow):
         velocidades = [
             ("0.5x", "-50%"), ("0.75x", "-25%"), ("1.0x (Normal)", "+0%"), 
             ("1.25x", "+25%"), ("1.5x", "+50%"), ("1.75x", "+75%"), 
-            ("2.0x", "+100%"), ("2.5x", "+150%"), ("3.0x", "+200%")
+            ("2.0x", "+100%")
         ]
         for nome, valor in velocidades:
             self.combo_velocidade.addItem(nome, valor)
@@ -148,6 +151,19 @@ class LeitorPDF(QMainWindow):
         linha2.addWidget(self.combo_velocidade)
 
         linha2.addSpacing(15)
+
+        self.btn_prev_phrase = QPushButton("⏮")
+        self.btn_prev_phrase.setToolTip("Frase Anterior")
+        self.btn_prev_phrase.clicked.connect(self.ir_frase_anterior)
+        self.btn_prev_phrase.setEnabled(False)
+        linha2.addWidget(self.btn_prev_phrase)
+
+        self.btn_next_phrase = QPushButton("⏭")
+        self.btn_next_phrase.setToolTip("Próxima Frase")
+        self.btn_next_phrase.clicked.connect(self.ir_proxima_frase)
+        self.btn_next_phrase.setEnabled(False)
+        linha2.addWidget(self.btn_next_phrase)
+
         self.btn_read = QPushButton("▶ Ler")
         self.btn_read.clicked.connect(self.iniciar_leitura)
         self.btn_read.setEnabled(False)
@@ -163,9 +179,6 @@ class LeitorPDF(QMainWindow):
         self.btn_stop.setEnabled(False)
         linha2.addWidget(self.btn_stop)
 
-        self.lbl_status = QLabel(f"  Status: Pronto{ATALHOS_TEXTO}")
-        linha2.addWidget(self.lbl_status)
-        
         linha2.addStretch()
 
         top_panel.addLayout(linha1)
@@ -188,6 +201,21 @@ class LeitorPDF(QMainWindow):
         container_principal.setLayout(main_layout)
         self.setCentralWidget(container_principal)
         
+        # --- BARRA DE STATUS ---
+        self.lbl_status = QLabel(f"Status: Pronto{ATALHOS_TEXTO}")
+        self.statusBar().addWidget(self.lbl_status)
+        
+        self.btn_cancel_export = QPushButton("❌ Cancelar")
+        self.btn_cancel_export.setObjectName("btn_cancel_export")
+        self.btn_cancel_export.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_cancel_export.clicked.connect(self.cancelar_exportacao)
+        self.btn_cancel_export.hide()
+        self.statusBar().addWidget(self.btn_cancel_export)
+        
+        self.lbl_paginacao = QLabel("Página: - / -")
+        self.lbl_paginacao.setStyleSheet("font-weight: bold; padding-right: 15px;")
+        self.statusBar().addPermanentWidget(self.lbl_paginacao)
+        
         self.atualizar_parametros_voz() 
 
     def aplicar_estilo(self):
@@ -198,19 +226,19 @@ class LeitorPDF(QMainWindow):
             QPushButton:disabled { background-color: #cccccc; color: #666666; }
             QPushButton#btn_stop { background-color: #D13438; }
             QPushButton#btn_stop:hover { background-color: #A4262C; }
-            QPushButton#btn_cancel_export { background-color: #D13438; }
+            QPushButton#btn_cancel_export { background-color: #D13438; padding: 2px 8px; margin-left: 10px; }
             QPushButton#btn_cancel_export:hover { background-color: #A4262C; }
             
             QComboBox { padding: 4px; border-radius: 3px; border: 1px solid #ccc; background: white; color: black; }
             QScrollArea { border: 1px solid #ccc; background-color: #2b2b2b; }
+            QStatusBar { background-color: #f0f0f0; color: #333; border-top: 1px solid #ccc; }
         """)
         self.btn_stop.setObjectName("btn_stop")
-        self.btn_cancel_export.setObjectName("btn_cancel_export")
 
     def mostrar_janela_sobre(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Sobre o MeuLeitorPDF")
-        dialog.resize(520, 490)
+        dialog.resize(500, 420)
         if os.path.exists("logo_pdf-bco.png"):
             dialog.setWindowIcon(QIcon("logo_pdf-bco.png"))
         
@@ -236,13 +264,17 @@ class LeitorPDF(QMainWindow):
         <body style="font-family: Arial, sans-serif; font-size: 10pt; color: #333;">
             <b>✨ Funcionalidades Principais:</b>
             <ul>
-                <li>Deteção automática de idioma (Português/Inglês/Espanhol) ao abrir o ficheiro.</li>
-                <li>Leitura em 3 idiomas (Português/Inglês/Espanhol).</li>
-                <li>Foco central estático: o texto desliza suavemente enquanto a linha ativa fica fixa no centro da tela.</li>
-                <li>Sumário interativo em lista com barra de rolagem clássica (quando disponível no arquivo).</li>
-                <li>Exportação completa do livro em formato MP3 (com opção de cancelamento).</li>
-                <li>Modo Noturno (Inversão de Cores) e controlo de zoom dinâmico.</li>
+                <li>Detecção automática de idioma ao abrir o ficheiro.</li>
+                <li>Mapeamento inteligente de páginas lógicas.</li>
+                <li>Avanço e retrocesso de frases.</li>
+                <li>Função Ir para [Página].</li>
+                <li>Inversão de cores (Fundo preto e letras brancas).</li>
+                <li>Barra de status com progresso de conversão em tempo real.</li>
+                <li>Sumário interativo (*Quando disponível).</li>
+                <li>Exportação completa do livro em formato MP3.</li>
             </ul>
+            
+            <p style="color: #555; font-size: 9pt;">*O sumário é extraído do próprio PDF, se estiver presente. Caso contrário, o botão de sumário ficará desativado.</p>
             
             <b>⌨️ Atalhos de Teclado Úteis:</b>
             <ul>
@@ -255,8 +287,8 @@ class LeitorPDF(QMainWindow):
             <b>Idealizado por Luis Roberto Porto Mendes</b><br>
             📫 <a href="mailto:lrpmendes@proton.me">lrpmendes@proton.me</a><br>
             Desenvolvido com Python, PyQt6 e Edge TTS.<br>
-            <b>Versão 1.0</b><br><br>
-            <b>Apoie o projeto</b> - Saiba como por e-mail.
+            <b>Versão 1.0</b><br>
+            Bugs ou melhorias? Me envie um e-mail! <a href="mailto:lrpmendes@proton.me">lrpmendes@proton.me</a>
         </body>
         """
         browser.setHtml(html_conteudo)
@@ -316,6 +348,57 @@ class LeitorPDF(QMainWindow):
                 self.combo_vozes.setCurrentIndex(i)
                 break
 
+    def construir_mapeamento_paginas(self):
+        self.logical_to_physical.clear()
+        self.physical_to_logical.clear()
+        candidates = []
+        for i in range(len(self.pdf_document)):
+            page = self.pdf_document.load_page(i)
+            page_height = page.rect.height
+            text_dict = page.get_text("dict")
+            for block in text_dict.get("blocks", []):
+                if block.get("type", 0) != 0:
+                    continue
+                bbox = block.get("bbox", (0, 0, 0, 0))
+                y0, y1 = bbox[1], bbox[3]
+                if y1 > page_height - 50 or y0 < 50:
+                    t = ""
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            t += span.get("text", "")
+                    t = t.strip()
+                    if t.isdigit():
+                        num = int(t)
+                        if 1 <= num <= len(self.pdf_document) + 200:
+                            candidates.append((i, num))
+                            break
+
+        valid_mapping = {}
+        last_num = -1
+        for phys, num in candidates:
+            if num > last_num:
+                valid_mapping[num] = phys
+                last_num = num
+
+        offset_counts = {}
+        for num, phys in valid_mapping.items():
+            off = phys - num
+            offset_counts[off] = offset_counts.get(off, 0) + 1
+            
+        best_offset = max(offset_counts, key=offset_counts.get) if offset_counts else 24
+
+        for phys in range(len(self.pdf_document)):
+            log_num = phys - best_offset + 1
+            if log_num < 1:
+                log_num = 1
+            self.physical_to_logical[phys] = log_num
+            if log_num not in self.logical_to_physical:
+                self.logical_to_physical[log_num] = phys
+
+        for num, phys in valid_mapping.items():
+            self.logical_to_physical[num] = phys
+            self.physical_to_logical[phys] = num
+
     def carregar_capitulos(self):
         self.capitulos_dados.clear()
         if self.pdf_document:
@@ -334,26 +417,19 @@ class LeitorPDF(QMainWindow):
 
     def mostrar_painel_capitulos(self):
         if not self.capitulos_dados: return
-        
         self.popup_dialog = QWidget(self, Qt.WindowType.Popup)
         self.popup_dialog.setWindowTitle("Sumário")
-        self.popup_dialog.resize(480, 350)
+        self.popup_dialog.resize(450, 350)
         if os.path.exists("logo_pdf-bco.png"):
             self.popup_dialog.setWindowIcon(QIcon("logo_pdf-bco.png"))
-        
         layout = QVBoxLayout(self.popup_dialog)
         layout.setContentsMargins(2, 2, 2, 2)
-        
         lista_widget = QListWidget()
-        lista_widget.setStyleSheet("font-size: 13px;")
-        
+        lista_widget.setStyleSheet("font-size: 14px;")
         for titulo, pagina in self.capitulos_dados:
             lista_widget.addItem(titulo)
-            
         lista_widget.itemClicked.connect(lambda item: self.selecionar_capitulo_popup(lista_widget.row(item)))
-        
         layout.addWidget(lista_widget)
-        
         pos_botao = self.btn_capitulos.mapToGlobal(QPoint(0, self.btn_capitulos.height()))
         self.popup_dialog.move(pos_botao)
         self.popup_dialog.show()
@@ -362,8 +438,63 @@ class LeitorPDF(QMainWindow):
         if 0 <= index < len(self.capitulos_dados):
             titulo, pagina = self.capitulos_dados[index]
             self.btn_capitulos.setText(f"📖 {titulo.strip()[:28]}...")
+            self.parar_leitura()
             self.rolar_para_pagina(pagina)
             self.popup_dialog.close()
+
+    def ir_para_pagina_dialog(self):
+        if not self.pdf_document: return
+        total_paginas = len(self.pdf_document)
+        min_log = min(self.logical_to_physical.keys()) if self.logical_to_physical else 1
+        max_log = max(self.logical_to_physical.keys()) if self.logical_to_physical else total_paginas
+        pagina_atual_log = self.physical_to_logical.get(self.current_page, self.current_page + 1)
+        num, ok = QInputDialog.getInt(self, "Ir para Página", f"Digite o número da página impressa no livro ({min_log} a {max_log}):", pagina_atual_log, min_log, max_log, 1)
+        if ok:
+            self.parar_leitura()
+            phys_page = self.logical_to_physical.get(num)
+            if phys_page is None:
+                phys_page = min(self.logical_to_physical.keys(), key=lambda k: abs(k - num))
+                phys_page = self.logical_to_physical[phys_page]
+            self.rolar_para_pagina(phys_page)
+
+    def ir_proxima_frase(self):
+        if not self.pdf_document: return
+        frases = self.obter_frases(self.current_page)
+        if self.current_phrase_idx + 1 < len(frases):
+            self.current_phrase_idx += 1
+        else:
+            if self.current_page + 1 < len(self.pdf_document):
+                self.current_page += 1
+                self.current_phrase_idx = 0
+                self.rolar_para_pagina(self.current_page)
+            else:
+                return
+        frases_atuais = self.obter_frases(self.current_page)
+        if self.current_phrase_idx < len(frases_atuais):
+            frase = frases_atuais[self.current_phrase_idx]
+            self.destacar_texto_na_tela(self.current_page, frase)
+        if self.btn_stop.isEnabled():
+            self.mudou_parametro_flag = True
+
+    def ir_frase_anterior(self):
+        if not self.pdf_document: return
+        if self.current_phrase_idx > 0:
+            self.current_phrase_idx -= 1
+        else:
+            if self.current_page > 0:
+                self.current_page -= 1
+                frases_ant = self.obter_frases(self.current_page)
+                self.current_phrase_idx = max(0, len(frases_ant) - 1)
+                self.rolar_para_pagina(self.current_page)
+            else:
+                self.current_phrase_idx = 0
+                return
+        frases_atuais = self.obter_frases(self.current_page)
+        if frases_atuais and self.current_phrase_idx < len(frases_atuais):
+            frase = frases_atuais[self.current_phrase_idx]
+            self.destacar_texto_na_tela(self.current_page, frase)
+        if self.btn_stop.isEnabled():
+            self.mudou_parametro_flag = True
 
     def exportar_audio_mp3(self):
         if not self.pdf_document: return
@@ -372,14 +503,14 @@ class LeitorPDF(QMainWindow):
         if not file_path: return
 
         self.cancelar_exportacao_flag = False
-        self.btn_export.hide()
+        self.btn_export.setEnabled(False)
         self.btn_cancel_export.show()
         self.btn_cancel_export.setEnabled(True)
 
         pagina_inicio = 0
         pagina_fim = len(self.pdf_document)
                 
-        self.lbl_status.setText("Status: A iniciar exportação do livro...")
+        self.lbl_status.setText("Status: A iniciar conversão para MP3...")
         threading.Thread(target=self._tarefa_exportar_mp3, args=(pagina_inicio, pagina_fim, file_path), daemon=True).start()
 
     def cancelar_exportacao(self):
@@ -389,21 +520,18 @@ class LeitorPDF(QMainWindow):
 
     def _tarefa_exportar_mp3(self, inicio, fim, caminho):
         try:
+            total_paginas = fim - inicio
             async def _run():
                 with open(caminho, 'wb') as f:
-                    for p in range(inicio, fim):
+                    for idx, p in enumerate(range(inicio, fim)):
                         if self.cancelar_exportacao_flag:
                             break
                         
-                        self.sinais.status_exportacao.emit(f"Status: A exportar página {p+1} de {fim}...")
+                        porcentagem = int(((idx + 1) / total_paginas) * 100)
+                        self.sinais.status_exportacao.emit(f"Status: A converter para MP3... Página {p+1} de {fim} ({porcentagem}% concluído)")
                         
-                        page = self.pdf_document.load_page(p)
-                        blocos = page.get_text("blocks")
-                        texto_pag = ""
-                        for bloco in blocos:
-                            t = bloco[4].replace('\n', ' ').strip()
-                            if t:
-                                texto_pag += t + ("." if not re.search(r'[.!?:]$', t) else " ")
+                        frases_pag = self.obter_frases(p)
+                        texto_pag = " ".join(frases_pag)
                                 
                         if len(texto_pag.strip()) > 10:
                             communicate = edge_tts.Communicate(texto_pag.strip(), self.voz_atual, rate=self.velocidade_atual)
@@ -414,13 +542,11 @@ class LeitorPDF(QMainWindow):
                                     f.write(chunk["data"])
                                     
                 if self.cancelar_exportacao_flag:
-                    try:
-                        os.remove(caminho)
-                    except:
-                        pass
+                    try: os.remove(caminho)
+                    except: pass
                     self.sinais.status_exportacao.emit(f"Status: Exportação cancelada.{ATALHOS_TEXTO}")
                 else:
-                    self.sinais.status_exportacao.emit(f"Status: Audiobook guardado com sucesso!{ATALHOS_TEXTO}")
+                    self.sinais.status_exportacao.emit(f"Status: Audiobook gerado com sucesso! Salvo como MP3.{ATALHOS_TEXTO}")
             
             asyncio.run(_run())
         except Exception as e:
@@ -430,7 +556,6 @@ class LeitorPDF(QMainWindow):
 
     def reset_ui_exportacao(self):
         self.btn_cancel_export.hide()
-        self.btn_export.show()
         self.btn_export.setEnabled(True)
 
     def atualizar_status(self, mensagem):
@@ -448,20 +573,17 @@ class LeitorPDF(QMainWindow):
         self.btn_pause.setEnabled(False)
         self.is_paused = False
         self.btn_pause.setText("⏸ Pausar")
-        self.lbl_status.setText(f"  Status: Pronto{ATALHOS_TEXTO}")
+        self.lbl_status.setText(f"Status: Pronto{ATALHOS_TEXTO}")
 
-    # --------- GESTÃO DE ZOOM OTIMIZADA COM DEBOUNCE ---------
     def zoom_in(self):
         self.zoom_factor += 0.2
-        self.lbl_status.setText(f"  Status: A aguardar zoom ({int(self.zoom_factor*100)}%)...")
-        # Inicia ou reinicia o temporizador de 500ms
+        self.lbl_status.setText(f"Status: A aguardar zoom ({int(self.zoom_factor*100)}%)...")
         self.timer_zoom.start(500)
 
     def zoom_out(self):
         if self.zoom_factor > 0.4:
             self.zoom_factor -= 0.2
-            self.lbl_status.setText(f"  Status: A aguardar zoom ({int(self.zoom_factor*100)}%)...")
-            # Inicia ou reinicia o temporizador de 500ms
+            self.lbl_status.setText(f"Status: A aguardar zoom ({int(self.zoom_factor*100)}%)...")
             self.timer_zoom.start(500)
 
     def abrir_pdf_dialog(self):
@@ -475,11 +597,20 @@ class LeitorPDF(QMainWindow):
             self.pdf_path = file_path
             self.btn_read.setEnabled(True)
             self.btn_export.setEnabled(True)
+            self.btn_ir_pagina.setEnabled(True)
+            self.btn_prev_phrase.setEnabled(True)
+            self.btn_next_phrase.setEnabled(True)
             
             self.detetar_idioma_e_ajustar_voz()
+            self.construir_mapeamento_paginas()
             self.carregar_capitulos()
             self.montar_esqueleto_paginas()
             self.current_page = pagina_inicial
+            self.current_phrase_idx = 0
+            
+            total_paginas = len(self.pdf_document)
+            log_num = self.physical_to_logical.get(self.current_page, self.current_page + 1)
+            self.lbl_paginacao.setText(f"Página: {log_num} / {total_paginas}")
             
             nome_arquivo = os.path.basename(self.pdf_path)
             self.setWindowTitle(f"MeuLeitorPDF - 📖 {nome_arquivo}")
@@ -510,9 +641,30 @@ class LeitorPDF(QMainWindow):
             self.page_labels.append(lbl)
         self.atualizar_paginas_visiveis()
 
+    def atualizar_frase_atual_por_scroll(self):
+        if not self.pdf_document or not self.page_labels: return
+        scrollbar = self.scroll_area.verticalScrollBar()
+        viewport_top = scrollbar.value()
+        ponto_foco = viewport_top + 30
+        
+        if 0 <= self.current_page < len(self.page_labels):
+            label_y = self.page_labels[self.current_page].pos().y()
+            local_y = ponto_foco - label_y
+            pdf_y = local_y / self.zoom_factor
+            
+            detalhes = self.obter_frases_detalhadas(self.current_page)
+            if detalhes:
+                melhor_idx = 0
+                menor_dist = float('inf')
+                for idx, item in enumerate(detalhes):
+                    dist = abs(item["y0"] - pdf_y)
+                    if dist < menor_dist:
+                        menor_dist = dist
+                        melhor_idx = idx
+                self.current_phrase_idx = melhor_idx
+
     def recalcular_tamanho_paginas(self):
         if not self.pdf_document: return
-        
         pagina_foco = self.current_page
         
         largura = int(self.base_width * self.zoom_factor)
@@ -521,17 +673,17 @@ class LeitorPDF(QMainWindow):
             lbl.setFixedSize(largura, altura)
             lbl.has_pixmap = False
             
-        # Pequeno atraso (50ms) para garantir que a interface regista as novas dimensões antes de fazer scroll
         QTimer.singleShot(50, lambda: self.rolar_para_pagina(pagina_foco))
         
-        # Restaura o status caso o utilizador não esteja a ouvir o áudio ativamente
         if not self.btn_stop.isEnabled():
-            self.lbl_status.setText(f"  Status: Pronto{ATALHOS_TEXTO}")
+            self.lbl_status.setText(f"Status: Pronto{ATALHOS_TEXTO}")
 
     def rolar_para_pagina(self, num_pagina):
-        if num_pagina < len(self.page_labels):
+        if 0 <= num_pagina < len(self.page_labels):
+            self.current_page = num_pagina
+            self.current_phrase_idx = 0
             pos_y = self.page_labels[num_pagina].pos().y()
-            self.scroll_area.verticalScrollBar().setValue(pos_y)
+            self.scroll_area.verticalScrollBar().setValue(int(pos_y))
             self.ignorar_scroll_inicial = False 
             self.atualizar_paginas_visiveis()
 
@@ -541,7 +693,7 @@ class LeitorPDF(QMainWindow):
         viewport_top = scrollbar.value()
         viewport_bottom = viewport_top + self.scroll_area.viewport().height()
         buffer_seguranca = 1000 
-        centro_tela = viewport_top + (self.scroll_area.viewport().height() // 2)
+        ponto_foco = viewport_top + 30 
 
         for i, lbl in enumerate(self.page_labels):
             lbl_top = lbl.pos().y()
@@ -551,9 +703,15 @@ class LeitorPDF(QMainWindow):
                 if not lbl.has_pixmap:
                     self.renderizar_pagina_unica(i, lbl)
                 
-                if lbl_top <= centro_tela <= lbl_bottom:
+                if lbl_top <= ponto_foco <= lbl_bottom:
                     if self.current_page != i:
                         self.current_page = i
+                        self.current_phrase_idx = 0
+                        if self.pdf_document:
+                            total = len(self.pdf_document)
+                            log_num = self.physical_to_logical.get(self.current_page, self.current_page + 1)
+                            self.lbl_paginacao.setText(f"Página: {log_num} / {total}")
+                        
                         if not self.ignorar_scroll_inicial:
                             self.salvar_checkpoint()
             else:
@@ -588,14 +746,19 @@ class LeitorPDF(QMainWindow):
             if rects:
                 primeiro_rect = rects[0]
                 texto_y_escalado = primeiro_rect.y0 * self.zoom_factor
+                texto_y1_escalado = primeiro_rect.y1 * self.zoom_factor
                 label_pagina = self.page_labels[num_pagina]
                 posicao_absoluta_y = label_pagina.pos().y() + texto_y_escalado
+                posicao_absoluta_y1 = label_pagina.pos().y() + texto_y1_escalado
                 
                 scrollbar = self.scroll_area.verticalScrollBar()
+                viewport_top = scrollbar.value()
                 viewport_altura = self.scroll_area.viewport().height()
+                viewport_bottom = viewport_top + viewport_altura
                 
-                nova_posicao = int(posicao_absoluta_y - (viewport_altura / 2))
-                scrollbar.setValue(nova_posicao)
+                if posicao_absoluta_y < viewport_top + 50 or posicao_absoluta_y1 > viewport_bottom - 50:
+                    nova_posicao = int(posicao_absoluta_y - (viewport_altura / 3))
+                    scrollbar.setValue(nova_posicao)
 
                 for rect in rects:
                     annot = page.add_highlight_annot(rect)
@@ -620,23 +783,68 @@ class LeitorPDF(QMainWindow):
             if label.has_pixmap:
                 self.renderizar_pagina_unica(self.current_page, label)
 
-    def obter_frases(self, pagina_num):
+    def is_bloco_monoespacado(self, block):
+        total_chars = 0
+        mono_chars = 0
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                t = span.get("text", "")
+                length = len(t.strip())
+                if length == 0:
+                    continue
+                total_chars += length
+                font_name = span.get("font", "").lower()
+                if any(kw in font_name for kw in ['mono', 'courier', 'typewriter', 'fixed', 'consolas', 'code', 'lucidaconsole']):
+                    mono_chars += length
+        if total_chars == 0:
+            return False
+        return (mono_chars / total_chars) > 0.75
+
+    def obter_frases_detalhadas(self, pagina_num):
         page = self.pdf_document.load_page(pagina_num)
-        blocos = page.get_text("blocks")
-        frases_finais = []
+        text_dict = page.get_text("dict")
+        page_height = page.rect.height
+        lista_detalhada = []
         
-        for bloco in blocos:
-            texto_bloco = bloco[4].replace('\n', ' ').strip()
-            if not texto_bloco:
+        for block in text_dict.get("blocks", []):
+            if block.get("type", 0) != 0: 
                 continue
             
-            frases_bloco = re.split(r'(?<=[.!?]) +', texto_bloco)
-            for f in frases_bloco:
-                f_limpa = f.strip()
-                if len(f_limpa) >= 2:
-                    frases_finais.append(f_limpa)
-                    
-        return frases_finais
+            bbox = block.get("bbox", (0, 0, 0, 0))
+            y0, y1 = bbox[1], bbox[3]
+            
+            if y0 < 120 or y1 > page_height - 70:
+                texto_teste = ""
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        texto_teste += span.get("text", "")
+                texto_teste = texto_teste.strip()
+                if re.match(r'^\d+$', texto_teste) or len(texto_teste) < 60 or re.match(r'^\d+\s*[-–—]', texto_teste):
+                    continue
+
+            if self.is_bloco_monoespacado(block):
+                continue
+            
+            for line in block.get("lines", []):
+                line_bbox = line.get("bbox", (0, 0, 0, 0))
+                line_y0 = line_bbox[1]
+                
+                linha_texto_partes = []
+                for span in line.get("spans", []):
+                    linha_texto_partes.append(span.get("text", ""))
+                linha_str = "".join(linha_texto_partes).strip()
+                if not linha_str:
+                    continue
+                
+                frases_linha = re.split(r'(?<=[.!?]) +', linha_str)
+                for f in frases_linha:
+                    f_limpa = f.strip()
+                    if len(f_limpa) >= 2 and not re.match(r'^\d+$', f_limpa):
+                        lista_detalhada.append({"texto": f_limpa, "y0": line_y0})
+        return lista_detalhada
+
+    def obter_frases(self, pagina_num):
+        return [item["texto"] for item in self.obter_frases_detalhadas(pagina_num)]
 
     def obter_proxima_frase_valida(self, pagina, frase_idx, frases_atuais):
         prox_idx = frase_idx + 1
@@ -665,26 +873,27 @@ class LeitorPDF(QMainWindow):
             pygame.mixer.music.unpause()
             self.is_paused = False
             self.btn_pause.setText("⏸ Pausar")
-            self.lbl_status.setText(f"  Status: A ler...{ATALHOS_TEXTO}")
+            self.lbl_status.setText(f"Status: A ler...{ATALHOS_TEXTO}")
         else:
             pygame.mixer.music.pause()
             self.is_paused = True
             self.btn_pause.setText("▶ Retomar")
-            self.lbl_status.setText(f"  Status: Em pausa{ATALHOS_TEXTO}")
+            self.lbl_status.setText(f"Status: Em pausa{ATALHOS_TEXTO}")
 
     def iniciar_leitura(self):
         if not self.pdf_document: return
+        self.atualizar_frase_atual_por_scroll()
         self.btn_read.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.btn_pause.setEnabled(True)
-        self.lbl_status.setText(f"  Status: A ler...{ATALHOS_TEXTO}")
+        self.lbl_status.setText(f"Status: A ler...{ATALHOS_TEXTO}")
         self.parar_flag = False
         self.mudou_parametro_flag = False
-        threading.Thread(target=self._motor_fala, args=(self.current_page,), daemon=True).start()
+        threading.Thread(target=self._motor_fala, args=(self.current_page, self.current_phrase_idx), daemon=True).start()
 
-    def _motor_fala(self, pagina_inicial):
+    def _motor_fala(self, pagina_inicial, frase_idx_inicial):
         pagina = pagina_inicial
-        frase_idx = 0
+        frase_idx = frase_idx_inicial
         frases = self.obter_frases(pagina)
         
         arquivo_pre_gerado = None
@@ -694,13 +903,25 @@ class LeitorPDF(QMainWindow):
             while pagina < len(self.pdf_document):
                 if self.parar_flag: break
 
+                if self.mudou_parametro_flag:
+                    self.mudou_parametro_flag = False
+                    pagina = self.current_page
+                    frase_idx = self.current_phrase_idx
+                    frases = self.obter_frases(pagina)
+                    continue
+
                 if frase_idx >= len(frases):
                     pagina += 1
                     if pagina < len(self.pdf_document):
                         frases = self.obter_frases(pagina)
                         frase_idx = 0
+                        self.current_page = pagina
+                        self.current_phrase_idx = 0
                         self.sinais.mudar_pagina_scroll.emit(pagina)
                     continue
+
+                self.current_page = pagina
+                self.current_phrase_idx = frase_idx
 
                 frase = frases[frase_idx].strip()
                 if len(frase) < 2:
@@ -729,7 +950,6 @@ class LeitorPDF(QMainWindow):
 
                 prox_p, prox_idx, prox_frase = self.obter_proxima_frase_valida(pagina, frase_idx, frases)
                 if prox_frase and not self.parar_flag and not self.mudou_parametro_flag:
-                    
                     texto_prox_tts = prox_frase.strip()
                     if not re.search(r'[.!?:]$', texto_prox_tts):
                         texto_prox_tts += "."
@@ -747,7 +967,6 @@ class LeitorPDF(QMainWindow):
                         break
                     
                     if self.mudou_parametro_flag:
-                        self.mudou_parametro_flag = False
                         interrompido_por_mudanca = True
                         pygame.mixer.music.stop()
                         break
