@@ -32,6 +32,9 @@ class LeitorPDF(QMainWindow):
         self.setWindowTitle("MeuLeitorPDF")
         self.setGeometry(100, 100, 1150, 800)
 
+        if os.path.exists("logo_pdf-bco.png"):
+            self.setWindowIcon(QIcon("logo_pdf-bco.png"))
+
         pygame.mixer.init(buffer=512)
         
         self.parar_flag = False
@@ -51,6 +54,11 @@ class LeitorPDF(QMainWindow):
         self.velocidade_atual = "+0%"
         self.ignorar_scroll_inicial = True 
 
+        # Temporizador para "Debounce" do Zoom (Aguardar antes de atualizar a tela)
+        self.timer_zoom = QTimer()
+        self.timer_zoom.setSingleShot(True)
+        self.timer_zoom.timeout.connect(self.recalcular_tamanho_paginas)
+
         self.sinais = Sinais()
         self.sinais.mudar_pagina_scroll.connect(self.rolar_para_pagina)
         self.sinais.destacar_frase.connect(self.destacar_texto_na_tela)
@@ -68,7 +76,6 @@ class LeitorPDF(QMainWindow):
         
         top_panel = QVBoxLayout()
 
-        # --- LINHA 1: FICHEIRO, VISUALIZAÇÃO E BOTÃO SOBRE/AJUDA ---
         linha1 = QHBoxLayout()
         linha1.setAlignment(Qt.AlignmentFlag.AlignLeft)
 
@@ -111,7 +118,6 @@ class LeitorPDF(QMainWindow):
         self.btn_sobre.clicked.connect(self.mostrar_janela_sobre)
         linha1.addWidget(self.btn_sobre)
 
-        # --- LINHA 2: CONTROLOS DE VOZ E LEITURA ---
         linha2 = QHBoxLayout()
         linha2.setAlignment(Qt.AlignmentFlag.AlignLeft)
 
@@ -165,7 +171,6 @@ class LeitorPDF(QMainWindow):
         top_panel.addLayout(linha1)
         top_panel.addLayout(linha2)
 
-        # --- ÁREA DO PDF ---
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.verticalScrollBar().valueChanged.connect(self.atualizar_paginas_visiveis)
@@ -203,16 +208,15 @@ class LeitorPDF(QMainWindow):
         self.btn_cancel_export.setObjectName("btn_cancel_export")
 
     def mostrar_janela_sobre(self):
-        """Apresenta a janela de Sobre com o logotipo limpo e as suas informações."""
         dialog = QDialog(self)
         dialog.setWindowTitle("Sobre o MeuLeitorPDF")
         dialog.resize(520, 490)
+        if os.path.exists("logo_pdf-bco.png"):
+            dialog.setWindowIcon(QIcon("logo_pdf-bco.png"))
         
         layout = QVBoxLayout(dialog)
         
-        # Cabeçalho com Logo e Título
         header_layout = QHBoxLayout()
-        
         lbl_logo = QLabel()
         if os.path.exists("logo_pdf-bco.png"):
             pixmap = QPixmap("logo_pdf-bco.png").scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
@@ -225,7 +229,6 @@ class LeitorPDF(QMainWindow):
         
         layout.addLayout(header_layout)
 
-        # Conteúdo em Texto Formatado
         browser = QTextBrowser()
         browser.setOpenExternalLinks(True)
         
@@ -259,7 +262,6 @@ class LeitorPDF(QMainWindow):
         browser.setHtml(html_conteudo)
         layout.addWidget(browser)
         
-        # Botão Fechar
         btn_fechar = QPushButton("Fechar")
         btn_fechar.clicked.connect(dialog.close)
         layout.addWidget(btn_fechar, alignment=Qt.AlignmentFlag.AlignRight)
@@ -335,13 +337,15 @@ class LeitorPDF(QMainWindow):
         
         self.popup_dialog = QWidget(self, Qt.WindowType.Popup)
         self.popup_dialog.setWindowTitle("Sumário")
-        self.popup_dialog.resize(450, 350)
+        self.popup_dialog.resize(480, 350)
+        if os.path.exists("logo_pdf-bco.png"):
+            self.popup_dialog.setWindowIcon(QIcon("logo_pdf-bco.png"))
         
         layout = QVBoxLayout(self.popup_dialog)
         layout.setContentsMargins(2, 2, 2, 2)
         
         lista_widget = QListWidget()
-        lista_widget.setStyleSheet("font-size: 14px;")
+        lista_widget.setStyleSheet("font-size: 13px;")
         
         for titulo, pagina in self.capitulos_dados:
             lista_widget.addItem(titulo)
@@ -446,14 +450,19 @@ class LeitorPDF(QMainWindow):
         self.btn_pause.setText("⏸ Pausar")
         self.lbl_status.setText(f"  Status: Pronto{ATALHOS_TEXTO}")
 
+    # --------- GESTÃO DE ZOOM OTIMIZADA COM DEBOUNCE ---------
     def zoom_in(self):
         self.zoom_factor += 0.2
-        self.recalcular_tamanho_paginas()
+        self.lbl_status.setText(f"  Status: A aguardar zoom ({int(self.zoom_factor*100)}%)...")
+        # Inicia ou reinicia o temporizador de 500ms
+        self.timer_zoom.start(500)
 
     def zoom_out(self):
         if self.zoom_factor > 0.4:
             self.zoom_factor -= 0.2
-            self.recalcular_tamanho_paginas()
+            self.lbl_status.setText(f"  Status: A aguardar zoom ({int(self.zoom_factor*100)}%)...")
+            # Inicia ou reinicia o temporizador de 500ms
+            self.timer_zoom.start(500)
 
     def abrir_pdf_dialog(self):
         file_name, _ = QFileDialog.getOpenFileName(self, "Selecione um PDF", "", "Arquivos PDF (*.pdf)")
@@ -503,12 +512,21 @@ class LeitorPDF(QMainWindow):
 
     def recalcular_tamanho_paginas(self):
         if not self.pdf_document: return
+        
+        pagina_foco = self.current_page
+        
         largura = int(self.base_width * self.zoom_factor)
         altura = int(self.base_height * self.zoom_factor)
         for lbl in self.page_labels:
             lbl.setFixedSize(largura, altura)
             lbl.has_pixmap = False
-        self.atualizar_paginas_visiveis()
+            
+        # Pequeno atraso (50ms) para garantir que a interface regista as novas dimensões antes de fazer scroll
+        QTimer.singleShot(50, lambda: self.rolar_para_pagina(pagina_foco))
+        
+        # Restaura o status caso o utilizador não esteja a ouvir o áudio ativamente
+        if not self.btn_stop.isEnabled():
+            self.lbl_status.setText(f"  Status: Pronto{ATALHOS_TEXTO}")
 
     def rolar_para_pagina(self, num_pagina):
         if num_pagina < len(self.page_labels):
@@ -781,6 +799,13 @@ class LeitorPDF(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    
+    app.setApplicationName("MeuLeitorPDF")
+    app.setDesktopFileName("meuleitorpdf")
+
+    if os.path.exists("logo_pdf-bco.png"):
+        app.setWindowIcon(QIcon("logo_pdf-bco.png"))
+
     window = LeitorPDF()
     window.show()
     exit_code = app.exec()
