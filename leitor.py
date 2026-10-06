@@ -1,3 +1,4 @@
+import shutil
 import sys
 import pymupdf
 import threading
@@ -8,6 +9,9 @@ import asyncio
 import edge_tts
 import uuid
 import tempfile
+import hashlib
+import subprocess
+from pathlib import Path
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 import pygame
 
@@ -17,7 +21,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout
 from PyQt6.QtGui import QImage, QPixmap, QIcon
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QPoint
 
-CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".config_leitor.json")
+APP_DIR = Path(__file__).resolve().parent
+CONFIG_DIR = Path(os.path.expanduser("~/.config/meuleitorpdf"))
+CACHE_DIR = Path(os.path.expanduser("~/.cache/meuleitorpdf/audio"))
+CONFIG_FILE = CONFIG_DIR / "config.json"
+LOGO_FILE = APP_DIR / "logo_pdf-bco.png"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 ATALHOS_TEXTO = " (Atalhos: Espaço: Pausar/Retomar | Ctrl+Espaço: Parar)"
 
 class Sinais(QObject):
@@ -26,6 +36,9 @@ class Sinais(QObject):
     resetar_botoes = pyqtSignal()
     status_exportacao = pyqtSignal(str)
     resetar_botoes_exportacao = pyqtSignal()
+    status_leitura = pyqtSignal(str)
+    limpar_destaques = pyqtSignal()
+    atualizar_estado_leitura = pyqtSignal(int, int)
 
 class LeitorPDF(QMainWindow):
     def __init__(self):
@@ -33,8 +46,8 @@ class LeitorPDF(QMainWindow):
         self.setWindowTitle("MeuLeitorPDF")
         self.setGeometry(100, 100, 1150, 800)
 
-        if os.path.exists("logo_pdf-bco.png"):
-            self.setWindowIcon(QIcon("logo_pdf-bco.png"))
+        if LOGO_FILE.exists():
+            self.setWindowIcon(QIcon(str(LOGO_FILE)))
 
         pygame.mixer.init(buffer=512)
         
@@ -43,6 +56,16 @@ class LeitorPDF(QMainWindow):
         self.is_paused = False
         self.dark_mode = False
         self.cancelar_exportacao_flag = False
+
+        # Eventos devem existir antes de qualquer uso.
+        self._stop_event = threading.Event()
+        self._restart_event = threading.Event()
+        self._export_cancel_event = threading.Event()
+        self._state_lock = threading.RLock()
+        self.frases_cache = {}
+        self._pdf_generation = 0
+        self.audio_cache_hits = 0
+        self.audio_cache_misses = 0
 
         self.pdf_document = None
         self.pdf_path = None
@@ -69,10 +92,35 @@ class LeitorPDF(QMainWindow):
         self.sinais.resetar_botoes.connect(self.reset_ui_botoes)
         self.sinais.status_exportacao.connect(self.atualizar_status)
         self.sinais.resetar_botoes_exportacao.connect(self.reset_ui_exportacao)
+        self.sinais.status_leitura.connect(self.atualizar_status)
+        self.sinais.limpar_destaques.connect(self.limpar_todos_destaques)
+        self.sinais.atualizar_estado_leitura.connect(self.atualizar_estado_leitura)
 
         self.initUI()
         self.carregar_checkpoint()
         self.aplicar_estilo()
+
+    def atualizar_estado_leitura(self, pagina, frase_idx):
+        """Atualiza estado de navegação somente na thread da interface."""
+        self.current_page = pagina
+        self.current_phrase_idx = frase_idx
+
+    def _audio_cache_path(self, texto, voz, velocidade):
+        chave = f"{voz}|{velocidade}|{texto}".encode("utf-8")
+        digest = hashlib.sha256(chave).hexdigest()
+        return CACHE_DIR / f"{digest}.mp3"
+
+    def _normalizar_texto_tts(self, texto):
+        texto = re.sub(r"\\s+", " ", texto).strip()
+        if texto and not re.search(r"[.!?:]$", texto):
+            texto += "."
+        return texto
+
+    def _parar_solicitado(self):
+        return self._stop_event.is_set()
+
+    def _reinicio_solicitado(self):
+        return self._restart_event.is_set()
 
     def initUI(self):
         main_layout = QVBoxLayout()
@@ -239,14 +287,14 @@ class LeitorPDF(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("Sobre o MeuLeitorPDF")
         dialog.resize(500, 420)
-        if os.path.exists("logo_pdf-bco.png"):
-            dialog.setWindowIcon(QIcon("logo_pdf-bco.png"))
+        if LOGO_FILE.exists():
+            dialog.setWindowIcon(QIcon(str(LOGO_FILE)))
         
         layout = QVBoxLayout(dialog)
         
         header_layout = QHBoxLayout()
         lbl_logo = QLabel()
-        if os.path.exists("logo_pdf-bco.png"):
+        if LOGO_FILE.exists():
             pixmap = QPixmap("logo_pdf-bco.png").scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             lbl_logo.setPixmap(pixmap)
         header_layout.addWidget(lbl_logo)
@@ -287,7 +335,7 @@ class LeitorPDF(QMainWindow):
             <b>Idealizado por Luis Roberto Porto Mendes</b><br>
             📫 <a href="mailto:lrpmendes@proton.me">lrpmendes@proton.me</a><br>
             Desenvolvido com Python, PyQt6 e Edge TTS.<br>
-            <b>Versão 1.0</b><br>
+            <b>Versão 1.1</b><br>
             Bugs ou melhorias? Me envie um e-mail! <a href="mailto:lrpmendes@proton.me">lrpmendes@proton.me</a>
         </body>
         """
@@ -420,8 +468,8 @@ class LeitorPDF(QMainWindow):
         self.popup_dialog = QWidget(self, Qt.WindowType.Popup)
         self.popup_dialog.setWindowTitle("Sumário")
         self.popup_dialog.resize(450, 350)
-        if os.path.exists("logo_pdf-bco.png"):
-            self.popup_dialog.setWindowIcon(QIcon("logo_pdf-bco.png"))
+        if LOGO_FILE.exists():
+            self.popup_dialog.setWindowIcon(QIcon(str(LOGO_FILE)))
         layout = QVBoxLayout(self.popup_dialog)
         layout.setContentsMargins(2, 2, 2, 2)
         lista_widget = QListWidget()
@@ -475,6 +523,7 @@ class LeitorPDF(QMainWindow):
             self.destacar_texto_na_tela(self.current_page, frase)
         if self.btn_stop.isEnabled():
             self.mudou_parametro_flag = True
+            self._restart_event.set()
 
     def ir_frase_anterior(self):
         if not self.pdf_document: return
@@ -503,6 +552,7 @@ class LeitorPDF(QMainWindow):
         if not file_path: return
 
         self.cancelar_exportacao_flag = False
+        self._export_cancel_event.clear()
         self.btn_export.setEnabled(False)
         self.btn_cancel_export.show()
         self.btn_cancel_export.setEnabled(True)
@@ -515,48 +565,138 @@ class LeitorPDF(QMainWindow):
 
     def cancelar_exportacao(self):
         self.cancelar_exportacao_flag = True
+        self._export_cancel_event.set()
         self.btn_cancel_export.setEnabled(False)
         self.lbl_status.setText("Status: A cancelar exportação...")
 
     def _tarefa_exportar_mp3(self, inicio, fim, caminho):
+        """
+        Exporta cada página para um MP3 temporário e concatena os arquivos
+        com ffmpeg quando disponível. Isso evita simplesmente concatenar
+        múltiplos fluxos MP3 independentes no mesmo arquivo.
+        """
+        temp_files = []
+        export_documento = None
+
+        async def gerar_pagina(texto, arquivo):
+            communicate = edge_tts.Communicate(
+                texto,
+                self.voz_atual,
+                rate=self.velocidade_atual,
+            )
+            await communicate.save(arquivo)
+
         try:
-            total_paginas = fim - inicio
-            async def _run():
-                with open(caminho, 'wb') as f:
-                    for idx, p in enumerate(range(inicio, fim)):
-                        if self.cancelar_exportacao_flag:
-                            break
-                        
-                        porcentagem = int(((idx + 1) / total_paginas) * 100)
-                        self.sinais.status_exportacao.emit(f"Status: A converter para MP3... Página {p+1} de {fim} ({porcentagem}% concluído)")
-                        
-                        frases_pag = self.obter_frases(p)
-                        texto_pag = " ".join(frases_pag)
-                                
-                        if len(texto_pag.strip()) > 10:
-                            communicate = edge_tts.Communicate(texto_pag.strip(), self.voz_atual, rate=self.velocidade_atual)
-                            async for chunk in communicate.stream():
-                                if self.cancelar_exportacao_flag:
-                                    break
-                                if chunk["type"] == "audio":
-                                    f.write(chunk["data"])
-                                    
-                if self.cancelar_exportacao_flag:
-                    try: os.remove(caminho)
-                    except: pass
-                    self.sinais.status_exportacao.emit(f"Status: Exportação cancelada.{ATALHOS_TEXTO}")
+            export_documento = pymupdf.open(self.pdf_path)
+            total_paginas = max(1, fim - inicio)
+
+            for idx, p in enumerate(range(inicio, fim)):
+                if self.cancelar_exportacao_flag or self._export_cancel_event.is_set():
+                    break
+
+                porcentagem = int(((idx + 1) / total_paginas) * 100)
+                self.sinais.status_exportacao.emit(
+                    f"Status: A converter para MP3... "
+                    f"Página {p+1} de {fim} ({porcentagem}% concluído)"
+                )
+
+                frases_pag = self.obter_frases(p, document=export_documento)
+                texto_pag = " ".join(frases_pag).strip()
+                if len(texto_pag) <= 10:
+                    continue
+
+                arquivo = os.path.join(
+                    tempfile.gettempdir(),
+                    f"meuleitor_export_{uuid.uuid4().hex}.mp3",
+                )
+
+                # Usa cache quando possível.
+                cache_file = self._audio_cache_path(
+                    texto_pag, self.voz_atual, self.velocidade_atual
+                )
+                if cache_file.exists() and cache_file.stat().st_size > 0:
+                    shutil.copy2(cache_file, arquivo)
                 else:
-                    self.sinais.status_exportacao.emit(f"Status: Audiobook gerado com sucesso! Salvo como MP3.{ATALHOS_TEXTO}")
-            
-            asyncio.run(_run())
+                    asyncio.run(gerar_pagina(texto_pag, arquivo))
+                    if os.path.exists(arquivo):
+                        shutil.copy2(arquivo, cache_file)
+
+                temp_files.append(arquivo)
+
+            if self.cancelar_exportacao_flag or self._export_cancel_event.is_set():
+                if os.path.exists(caminho):
+                    os.remove(caminho)
+                self.sinais.status_exportacao.emit(
+                    f"Status: Exportação cancelada.{ATALHOS_TEXTO}"
+                )
+                return
+
+            if not temp_files:
+                raise RuntimeError("Não foi encontrado texto suficiente para exportar.")
+
+            ffmpeg = shutil.which("ffmpeg")
+            if not ffmpeg:
+                raise RuntimeError(
+                    "O ffmpeg não está instalado. Instale-o para gerar um MP3 final "
+                    "a partir das páginas."
+                )
+
+            lista = os.path.join(
+                tempfile.gettempdir(), f"meuleitor_concat_{uuid.uuid4().hex}.txt"
+            )
+            try:
+                with open(lista, "w", encoding="utf-8") as f:
+                    for item in temp_files:
+                        # Caminho absoluto escapado para o demuxer concat.
+                        safe = os.path.abspath(item).replace("'", "'\''")
+                        f.write(f"file '{safe}'\n")
+
+                subprocess.run(
+                    [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", lista,
+                     "-c", "copy", caminho],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            finally:
+                try:
+                    os.remove(lista)
+                except OSError:
+                    pass
+
+            self.sinais.status_exportacao.emit(
+                f"Status: Audiobook gerado com sucesso! Salvo como MP3."
+                f"{ATALHOS_TEXTO}"
+            )
+
         except Exception as e:
-            self.sinais.status_exportacao.emit(f"Status: Erro ao exportar - {str(e)}{ATALHOS_TEXTO}")
+            try:
+                if os.path.exists(caminho):
+                    os.remove(caminho)
+            except OSError:
+                pass
+            self.sinais.status_exportacao.emit(
+                f"Status: Erro ao exportar - {e}{ATALHOS_TEXTO}"
+            )
         finally:
+            if export_documento is not None:
+                try:
+                    export_documento.close()
+                except Exception:
+                    pass
+            for arquivo in temp_files:
+                try:
+                    os.remove(arquivo)
+                except OSError:
+                    pass
             self.sinais.resetar_botoes_exportacao.emit()
 
     def reset_ui_exportacao(self):
         self.btn_cancel_export.hide()
         self.btn_export.setEnabled(True)
+        self._export_cancel_event.clear()
+        self.cancelar_exportacao_flag = False
 
     def atualizar_status(self, mensagem):
         self.lbl_status.setText(mensagem)
@@ -566,6 +706,7 @@ class LeitorPDF(QMainWindow):
         self.velocidade_atual = self.combo_velocidade.currentData()
         if self.btn_stop.isEnabled():
             self.mudou_parametro_flag = True
+            self._restart_event.set()
 
     def reset_ui_botoes(self):
         self.btn_read.setEnabled(True)
@@ -593,7 +734,19 @@ class LeitorPDF(QMainWindow):
 
     def abrir_pdf(self, file_path, pagina_inicial):
         try:
+            self._stop_event.set()
+            self._restart_event.set()
+            if self.pdf_document is not None:
+                try:
+                    self.pdf_document.close()
+                except Exception:
+                    pass
+
             self.pdf_document = pymupdf.open(file_path)
+            self.frases_cache.clear()
+            self._pdf_generation += 1
+            self._stop_event.clear()
+            self._restart_event.clear()
             self.pdf_path = file_path
             self.btn_read.setEnabled(True)
             self.btn_export.setEnabled(True)
@@ -801,8 +954,12 @@ class LeitorPDF(QMainWindow):
             return False
         return (mono_chars / total_chars) > 0.75
 
-    def obter_frases_detalhadas(self, pagina_num):
-        page = self.pdf_document.load_page(pagina_num)
+    def obter_frases_detalhadas(self, pagina_num, document=None):
+        if pagina_num in self.frases_cache:
+            return self.frases_cache[pagina_num]
+
+        document = document or self.pdf_document
+        page = document.load_page(pagina_num)
         text_dict = page.get_text("dict")
         page_height = page.rect.height
         lista_detalhada = []
@@ -857,12 +1014,16 @@ class LeitorPDF(QMainWindow):
                     
         return lista_detalhada
 
-    def obter_frases(self, pagina_num):
-        return [item["texto"] for item in self.obter_frases_detalhadas(pagina_num)]
+    def obter_frases(self, pagina_num, document=None):
+        return [
+            item["texto"]
+            for item in self.obter_frases_detalhadas(pagina_num, document=document)
+        ]
 
-    def obter_proxima_frase_valida(self, pagina, frase_idx, frases_atuais):
+    def obter_proxima_frase_valida(self, pagina, frase_idx, frases_atuais, document=None):
         prox_idx = frase_idx + 1
         p = pagina
+        total_paginas = len(document) if document is not None else len(self.pdf_document)
         f_list = frases_atuais
         while True:
             if prox_idx < len(f_list):
@@ -871,16 +1032,42 @@ class LeitorPDF(QMainWindow):
                 prox_idx += 1
             else:
                 p += 1
-                if p >= len(self.pdf_document):
+                if p >= total_paginas:
                     return None, None, None
-                f_list = self.obter_frases(p)
+                f_list = self.obter_frases(p, document=document)
                 prox_idx = 0
 
-    def gerar_audio_neural(self, texto, voz, taxa_velocidade, arquivo):
+    def gerar_audio_neural(self, texto, voz, taxa_velocidade, arquivo=None):
+        """
+        Gera o áudio e reutiliza o cache quando a mesma frase/voz/velocidade
+        já foi sintetizada. Retorna o caminho do MP3.
+        """
+        texto = self._normalizar_texto_tts(texto)
+        cache_file = self._audio_cache_path(texto, voz, taxa_velocidade)
+
+        if cache_file.exists() and cache_file.stat().st_size > 0:
+            self.audio_cache_hits += 1
+            if arquivo and Path(arquivo) != cache_file:
+                shutil.copy2(cache_file, arquivo)
+                return arquivo
+            return str(cache_file)
+
+        self.audio_cache_misses += 1
+
         async def _run():
             communicate = edge_tts.Communicate(texto, voz, rate=taxa_velocidade)
-            await communicate.save(arquivo)
+            await communicate.save(str(cache_file))
+
         asyncio.run(_run())
+
+        if not cache_file.exists() or cache_file.stat().st_size == 0:
+            raise RuntimeError("O Edge TTS não produziu um arquivo de áudio válido.")
+
+        if arquivo and Path(arquivo) != cache_file:
+            shutil.copy2(cache_file, arquivo)
+            return arquivo
+
+        return str(cache_file)
 
     def toggle_pause(self):
         if self.is_paused:
@@ -903,40 +1090,52 @@ class LeitorPDF(QMainWindow):
         self.lbl_status.setText(f"Status: A ler...{ATALHOS_TEXTO}")
         self.parar_flag = False
         self.mudou_parametro_flag = False
-        threading.Thread(target=self._motor_fala, args=(self.current_page, self.current_phrase_idx), daemon=True).start()
+        self._stop_event.clear()
+        self._restart_event.clear()
+        threading.Thread(
+            target=self._motor_fala,
+            args=(self.current_page, self.current_phrase_idx),
+            daemon=True,
+            name="MeuLeitorPDF-TTS",
+        ).start()
 
     def _motor_fala(self, pagina_inicial, frase_idx_inicial):
+        """
+        Motor de leitura. A thread de áudio não manipula widgets diretamente:
+        mudanças visuais passam por sinais Qt.
+        """
         pagina = pagina_inicial
         frase_idx = frase_idx_inicial
-        frases = self.obter_frases(pagina)
-        
-        arquivo_pre_gerado = None
-        id_pre_gerado = None 
-        temp_dir = tempfile.gettempdir()
+        leitura_documento = None
 
         try:
-            while pagina < len(self.pdf_document):
-                if self.parar_flag: break
+            # PyMuPDF fica isolado da thread da interface.
+            leitura_documento = pymupdf.open(self.pdf_path)
+            total_paginas = len(leitura_documento)
+            frases = self.obter_frases(pagina, document=leitura_documento)
 
-                if self.mudou_parametro_flag:
-                    self.mudou_parametro_flag = False
-                    pagina = self.current_page
-                    frase_idx = self.current_phrase_idx
-                    frases = self.obter_frases(pagina)
+            while pagina < total_paginas:
+                if self._parar_solicitado():
+                    break
+
+                if self._reinicio_solicitado():
+                    self._restart_event.clear()
+                    with self._state_lock:
+                        pagina = self.current_page
+                        frase_idx = self.current_phrase_idx
+                    frases = self.obter_frases(pagina, document=leitura_documento)
                     continue
 
                 if frase_idx >= len(frases):
                     pagina += 1
-                    if pagina < len(self.pdf_document):
-                        frases = self.obter_frases(pagina)
+                    if pagina < total_paginas:
+                        frases = self.obter_frases(pagina, document=leitura_documento)
                         frase_idx = 0
-                        self.current_page = pagina
-                        self.current_phrase_idx = 0
+                        self.sinais.atualizar_estado_leitura.emit(pagina, 0)
                         self.sinais.mudar_pagina_scroll.emit(pagina)
                     continue
 
-                self.current_page = pagina
-                self.current_phrase_idx = frase_idx
+                self.sinais.atualizar_estado_leitura.emit(pagina, frase_idx)
 
                 frase = frases[frase_idx].strip()
                 if len(frase) < 2:
@@ -944,73 +1143,70 @@ class LeitorPDF(QMainWindow):
                     continue
 
                 self.sinais.destacar_frase.emit(pagina, frase)
+
+                # Captura os parâmetros para que uma alteração na UI não
+                # mude o áudio no meio da frase atual.
                 v_voz = self.voz_atual
                 v_vel = self.velocidade_atual
-                
-                texto_tts = frase
-                if not re.search(r'[.!?:]$', texto_tts):
-                    texto_tts += "."
 
-                if arquivo_pre_gerado and id_pre_gerado == (pagina, frase_idx, v_voz, v_vel):
-                    temp_file = arquivo_pre_gerado
-                else:
-                    temp_file = os.path.join(temp_dir, f"temp_audio_{uuid.uuid4().hex}.mp3")
-                    self.gerar_audio_neural(texto_tts, v_voz, v_vel, temp_file)
+                temp_file = None
+                try:
+                    temp_file = self.gerar_audio_neural(frase, v_voz, v_vel)
+                    pygame.mixer.music.load(temp_file)
+                    pygame.mixer.music.play()
 
-                arquivo_pre_gerado = None
-                id_pre_gerado = None
+                    prox_p, prox_idx, prox_frase = self.obter_proxima_frase_valida(
+                        pagina, frase_idx, frases, document=leitura_documento
+                    )
 
-                pygame.mixer.music.load(temp_file)
-                pygame.mixer.music.play()
+                    # Pré-carrega a próxima frase no cache. O áudio fica
+                    # persistente e poderá ser reutilizado numa futura leitura.
+                    if (
+                        prox_frase
+                        and not self._parar_solicitado()
+                        and not self._reinicio_solicitado()
+                    ):
+                        self.gerar_audio_neural(prox_frase, v_voz, v_vel)
 
-                prox_p, prox_idx, prox_frase = self.obter_proxima_frase_valida(pagina, frase_idx, frases)
-                if prox_frase and not self.parar_flag and not self.mudou_parametro_flag:
-                    texto_prox_tts = prox_frase.strip()
-                    if not re.search(r'[.!?:]$', texto_prox_tts):
-                        texto_prox_tts += "."
-                        
-                    prox_temp = os.path.join(temp_dir, f"temp_audio_{uuid.uuid4().hex}.mp3")
-                    self.gerar_audio_neural(texto_prox_tts, v_voz, v_vel, prox_temp)
-                    arquivo_pre_gerado = prox_temp
-                    id_pre_gerado = (prox_p, prox_idx, v_voz, v_vel)
+                    clock = pygame.time.Clock()
+                    while pygame.mixer.music.get_busy() or self.is_paused:
+                        if self._parar_solicitado():
+                            pygame.mixer.music.stop()
+                            break
+                        if self._reinicio_solicitado():
+                            pygame.mixer.music.stop()
+                            break
+                        clock.tick(20)
 
-                interrompido_por_mudanca = False
-                
-                while pygame.mixer.music.get_busy() or self.is_paused:
-                    if self.parar_flag:
-                        pygame.mixer.music.stop()
-                        break
-                    
-                    if self.mudou_parametro_flag:
-                        interrompido_por_mudanca = True
-                        pygame.mixer.music.stop()
+                    if self._parar_solicitado():
                         break
 
-                    pygame.time.Clock().tick(20)
+                    if self._reinicio_solicitado():
+                        continue
 
-                try: os.remove(temp_file)
-                except: pass
+                    frase_idx += 1
 
-                if interrompido_por_mudanca:
-                    if arquivo_pre_gerado:
-                        try: os.remove(arquivo_pre_gerado)
-                        except: pass
-                        arquivo_pre_gerado = None
-                    continue
-
-                frase_idx += 1
+                finally:
+                    # O novo cache é persistente. Não removemos o arquivo aqui.
+                    pass
 
         except Exception as e:
-            self.sinais.status_exportacao.emit(f"Status: Erro na leitura - {str(e)}{ATALHOS_TEXTO}")
+            self.sinais.status_leitura.emit(
+                f"Status: Erro na leitura - {e}{ATALHOS_TEXTO}"
+            )
         finally:
-            if arquivo_pre_gerado:
-                try: os.remove(arquivo_pre_gerado)
-                except: pass
-            self.limpar_todos_destaques()
+            if leitura_documento is not None:
+                try:
+                    leitura_documento.close()
+                except Exception:
+                    pass
+            self.sinais.limpar_destaques.emit()
             self.sinais.resetar_botoes.emit()
 
     def parar_leitura(self):
         self.parar_flag = True
+        self._stop_event.set()
+        self._restart_event.set()
         if pygame.mixer.music.get_busy():
             pygame.mixer.music.stop()
         self.limpar_todos_destaques()
@@ -1019,8 +1215,19 @@ class LeitorPDF(QMainWindow):
         if self.pdf_path:
             try:
                 with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                    json.dump({"ultimo_pdf": self.pdf_path, "pagina": self.current_page}, f)
-            except:
+                    json.dump(
+                        {
+                            "ultimo_pdf": self.pdf_path,
+                            "pagina": self.current_page,
+                            "frase": self.current_phrase_idx,
+                            "voz": self.voz_atual,
+                            "velocidade": self.velocidade_atual,
+                        },
+                        f,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+            except OSError:
                 pass
 
     def carregar_checkpoint(self):
@@ -1030,9 +1237,36 @@ class LeitorPDF(QMainWindow):
                     dados = json.load(f)
                 ultimo_pdf = dados.get("ultimo_pdf")
                 if ultimo_pdf and os.path.exists(ultimo_pdf):
-                    self.abrir_pdf(ultimo_pdf, dados.get("pagina", 0))
+                    self.abrir_pdf(ultimo_pdf, max(0, int(dados.get("pagina", 0))))
+                    # Voz/velocidade serão aplicadas pela UI somente se existirem.
+                    voz = dados.get("voz")
+                    velocidade = dados.get("velocidade")
+                    for i in range(self.combo_vozes.count()):
+                        if self.combo_vozes.itemData(i) == voz:
+                            self.combo_vozes.setCurrentIndex(i)
+                            break
+                    for i in range(self.combo_velocidade.count()):
+                        if self.combo_velocidade.itemData(i) == velocidade:
+                            self.combo_velocidade.setCurrentIndex(i)
+                            break
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+
+    def closeEvent(self, event):
+        """Encerra áudio, sinaliza workers e fecha o PDF de forma limpa."""
+        self._stop_event.set()
+        self._restart_event.set()
+        try:
+            pygame.mixer.music.stop()
+            pygame.mixer.quit()
+        except Exception:
+            pass
+        if self.pdf_document is not None:
+            try:
+                self.pdf_document.close()
             except Exception:
                 pass
+        event.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
@@ -1040,8 +1274,8 @@ if __name__ == "__main__":
     app.setApplicationName("MeuLeitorPDF")
     app.setDesktopFileName("meuleitorpdf")
 
-    if os.path.exists("logo_pdf-bco.png"):
-        app.setWindowIcon(QIcon("logo_pdf-bco.png"))
+    if LOGO_FILE.exists():
+        app.setWindowIcon(QIcon(str(LOGO_FILE)))
 
     window = LeitorPDF()
     window.show()
